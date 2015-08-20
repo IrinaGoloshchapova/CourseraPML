@@ -1,0 +1,553 @@
+---
+title: "Coursera Practical Machine Learning Assignment"
+author: "Goloshchapova Irina"
+date: "18.08.2015"
+output: html_document
+---
+# Syllabus
+
+In this project, our goal will be to use data from accelerometers on the belt, forearm, arm, and dumbell of 6 participants. They were asked to perform barbell lifts correctly and incorrectly in 5 different ways. Detailed information is available from the [website](http://groupware.les.inf.puc-rio.br/har). Training dataset was collected [here](https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv) and testing data set - [here](https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv).  
+After the data preprocessing and exploratory analysis steps we evaluate several classification models on the training set, compare them on the validation set and implement the best algoritm on the testing set for submitting the result to Coursera website for grading.
+
+# Data Preprocessing
+
+**Step 1: Loading raw data and required packages.**
+
+`summary(trainRaw$classe)`
+```{r loading, echo = FALSE, message = FALSE, warning = FALSE, cache = TRUE}
+library(ggplot2)
+library(caret)
+library(randomForest)
+library(e1071)
+library(corrplot)
+library(parallel)
+library(doParallel)
+
+options(digits = 2)
+setwd("C:/PracticalML")
+
+download.file("http://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv", destfile = "Train.csv")
+download.file("http://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv", destfile = "Test.csv")
+
+trainRaw = read.csv("Train.csv", na.strings=c("", "NA", "NULL"))
+testRaw = read.csv("Test.csv", na.strings=c("", "NA", "NULL"))
+
+trainRaw$classe <- as.factor(trainRaw$classe)
+
+summary(trainRaw$classe)
+```
+As a result, we have `r dim(trainRaw)[1]` rows and `r dim(trainRaw)[2]` columns in training dataset and `r dim(testRaw)[1]` rows and `r dim(testRaw)[2]` columns in test dataset. This is raw data and it should be sufficiently preprocessed before modeling part.
+
+Full code of this part is shown in [Appendix.Loading data](#id1).
+
+**Step 2: Covariate set cleaning**
+
+```{r preprocess, echo = FALSE, message = FALSE, warning = FALSE, cache = TRUE}
+# Removing columns with NAs
+trainTrf <- trainRaw[ , colSums(is.na(trainRaw)) == 0]
+delta1 <- dim(trainRaw)[2] - dim(trainTrf)[2]
+
+# Removing unrelevant variables
+relevantVar <- grepl("belt|[^(fore)]arm|dumbbell|forearm|classe", names(trainTrf))
+trainRel <- trainTrf[, relevantVar]
+delta2 <- dim(trainTrf)[2] - dim(trainRel)[2]
+
+# Removing nzv variables
+nzv= nearZeroVar(trainRel[sapply(trainRel, is.numeric)], saveMetrics = TRUE)
+trainNnzv = trainRel[, nzv[, 'nzv'] == FALSE]
+delta3 <- dim(trainRel)[2] - dim(trainNnzv)[2]
+
+# Remove highly correlated variables
+corrM <- cor(trainNnzv[sapply(trainNnzv, is.numeric)])
+highCorr <- findCorrelation(corrM, cutoff = .85, verbose = FALSE)
+trainItog <- trainNnzv[, -highCorr]
+delta4 <- dim(trainNnzv)[2] - dim(trainItog)[2]
+```
+
+There are several approaches for reducing the number of predictors.
+
+- *Remove variables with too many NA values.* For the purpose of this analysis we take only predictors that have no NAs.  
+  As a result, we remove `r delta1` predictors.
+- *Remove unrelevant variables.* We take as predictors only belt, arm, dumbbell, and forearm variables and remove ones with unrelevant names.  
+  As a result, we remove `r delta2` predictors.
+- *Remove variables with near zero variance and near zero fraction of unique values.* For this task `nearZeroVar()` function from caret package could be very helpful.  
+  As a result, we remove `r delta3` predictors.
+- *Remove highly correlated variables.* We take as predictors only variables with correlation lower than 85%.  
+  As a result, we remove `r delta4` predictors.
+  
+You could see the code for the evaluation part of this section in [Appendix.Covariates preprocessing](#id2).
+
+**Correlogramm of covariates**
+
+```{r corrplot, echo = FALSE, message = FALSE, warning = FALSE, cache = TRUE, fig.show = TRUE, fig.height = 6.5, fig.width = 6.5}
+## Plot Correlation Matrix
+colour <- colorRampPalette(c("mediumpurple4", "white", "olivedrab"))
+corrplot(corrM, col = colour(10), order = "alphabet", 
+         method = "color", type = "lower", 
+         tl.cex = 0.7, tl.col = "black")
+```
+ 
+The code for the plot is placed in [Appendix.Corrplot](#id3). 
+ 
+Finally, we got a dataset of potential predictors with outcom variable `classe` and `r dim(trainItog)[2] - 1` covariates. And total `r dim(trainItog)[1]` observations for each variable.
+
+**Step 3: Splitting final dataset into train and validation sets**
+
+```{r splitting, echo = TRUE, message = FALSE, warning = FALSE, cache = TRUE}
+set.seed(2301)
+inTrain <- createDataPartition(trainItog$classe, p=0.7, list=FALSE)
+train <- trainItog[inTrain,]
+valid <- trainItog[-inTrain,]
+```
+
+So we got `r dim(train)[1]` rows and `r dim(train)[2]` columns in training dataset and `r dim(valid)[1]` rows and `r dim(valid)[2]` columns in validation dataset.
+
+# Model evaluation
+
+Now through evaluating models on the training set we are going to implement several machine learning algorithms that are in general effective. Models evaluation will be controlled by the 5-fold cross-validation procedure. 
+Then we'll compare models by general "goodness of fit" on the validation set and choose the best model for the testing set prediction.
+
+**Step 1: Evaluating models on the training set with 5-fold cross-validation**
+
+Here we implement:
+
+(1) C 5.0 (`C5.0`)  
+(2) Boosted trees (`gbm`)  
+(3) Random forests (`rf`)  
+(4) Bagged trees (`treebag`)  
+(5) Neural networks (`nnet`)
+(6) Support Vector Machines (`svmRadial`)
+
+The appropriate measure of the total "goodness of fit" for categorical variable prediction is the *accuracy measure*. It equals total right predictions divided by the total observations number.
+
+You could find the whole code for this part in [Appendix.Evaluating models](#id4).
+
+As a result we have the following tables.
+
+```{r evaluating, echo = FALSE, message = FALSE, warning = FALSE, cache = TRUE, results = 'hide'}
+# set seed
+set.seed(2301)
+
+# Setting clusters
+cl <- makeCluster(detectCores() - 1)
+registerDoParallel(cl)
+
+# Setting control parameters 
+ctrl <- trainControl(method = "repeatedcv", 
+                     number = 5,
+                     classProbs=TRUE,
+                     savePredictions=TRUE,
+                     allowParallel=TRUE)
+
+# (1) C5.0
+C5.0.m <- train(train$classe ~ ., method = "C5.0", verbose = FALSE,
+               data = train, trControl = ctrl)
+cm5.0 <- confusionMatrix(valid$classe, 
+                      predict(C5.0.m, valid))
+quality <- c(cm5.0$overall[1], cm5.0$byClass[1:4])
+
+cm5.0tr <- confusionMatrix(train$classe, 
+                      predict(C5.0.m, train))
+quality.train <- c(cm5.0tr$overall[1], cm5.0tr$byClass[1:4])
+
+# (2) gbm
+gbm.m <- train(train$classe ~ ., method = "gbm", verbose = FALSE,
+               data = train, trControl = ctrl)
+cm.gbm <- confusionMatrix(valid$classe, 
+                      predict(gbm.m, valid))
+quality.new <- c(cm.gbm$overall[1], cm.gbm$byClass[1:4])
+quality <- rbind(quality, quality.new)
+
+cm.gbmtr <- confusionMatrix(train$classe, 
+                      predict(gbm.m, train))
+quality.train.new <- c(cm.gbmtr$overall[1], cm.gbmtr$byClass[1:4])
+quality.train <- rbind(quality.train, quality.train.new)
+
+# (3) rf
+rf.m <- train(train$classe ~ ., method = "rf", verbose = FALSE,
+               data = train, trControl = ctrl)
+cm.rf <- confusionMatrix(valid$classe, 
+                      predict(rf.m, valid))
+quality.new <- c(cm.rf$overall[1], cm.rf$byClass[1:4])
+quality <- rbind(quality, quality.new)
+
+cm.rftr <- confusionMatrix(train$classe, 
+                      predict(rf.m, train))
+quality.train.new <- c(cm.rftr$overall[1], cm.rftr$byClass[1:4])
+quality.train <- rbind(quality.train, quality.train.new)
+# (4) treebag
+treebag.m <- train(train$classe ~ ., method = "treebag", 
+                   verbose = FALSE, data = train, trControl = ctrl)
+cm.treebag <- confusionMatrix(valid$classe, 
+                      predict(treebag.m, valid))
+quality.new <- c(cm.treebag$overall[1], cm.treebag$byClass[1:4])
+quality <- rbind(quality, quality.new)
+
+cm.treebagtr <- confusionMatrix(train$classe, 
+                      predict(treebag.m, train))
+quality.train.new <- c(cm.treebagtr$overall[1], cm.treebagtr$byClass[1:4])
+quality.train <- rbind(quality.train, quality.train.new)
+
+# (5) nnet
+nnet.m <- train(train$classe ~ ., method = "nnet", 
+                   verbose = FALSE, data = train, trControl = ctrl)
+cm.nnet <- confusionMatrix(valid$classe, 
+                      predict(nnet.m, valid))
+quality.new <- c(cm.nnet$overall[1], cm.nnet$byClass[1:4])
+quality <- rbind(quality, quality.new)
+
+cm.nnettr <- confusionMatrix(train$classe, 
+                      predict(nnet.m, train))
+quality.train.new <- c(cm.nnettr$overall[1], cm.nnettr$byClass[1:4])
+quality.train <- rbind(quality.train, quality.train.new)
+
+# (6) svmRadial
+svmRadial.m <- train(train$classe ~ ., method = "svmRadial", 
+                   verbose = FALSE, data = train, trControl = ctrl)
+cm.svmRadial <- confusionMatrix(valid$classe, 
+                      predict(svmRadial.m, valid))
+quality.new <- c(cm.svmRadial$overall[1], cm.svmRadial$byClass[1:4])
+quality <- rbind(quality, quality.new)
+
+cm.svmRadialtr <- confusionMatrix(train$classe, 
+                      predict(svmRadial.m, train))
+quality.train.new <- c(cm.svmRadialtr$overall[1], cm.svmRadialtr$byClass[1:4])
+quality.train <- rbind(quality.train, quality.train.new)
+
+# Stop clusters
+stopCluster(cl)
+
+# Naming datasets
+methods.m <- c("C5.0", "gbm", "rf", "treebag", 
+               "nnet", "svmRadial")
+quality <- as.data.frame(quality)
+quality.train <- as.data.frame(quality.train)
+
+row.names(quality) <- methods.m
+row.names(quality.train) <- methods.m
+```
+
+**Table 1. Model evaluation results: training set with cross-validation.**
+```{r table1, echo = FALSE, cache = TRUE}
+library(printr)
+options(digits = 2)
+names.col <- c("Accuracy", "Sensitivity", "Specificity",
+               "Pos.Pred.Value", "Neg.Pred.Value")
+names(quality.train) <- names.col
+quality.train
+```
+
+According to the results, the best algorithm for the prediction of the outcome variable (`classe`) is C5.0 classification algorithm with almost perfect prediction. In such a situation it's necessary to exclude overfitting possibility.
+
+**Step 2: comparing models by general "goodness of fit" on the validation set**
+
+**Table 2. Model evaluation results: validation set.**
+```{r table2, echo = FALSE, cache = TRUE}
+names(quality) <- names.col
+options(digits = 2)
+quality
+```
+
+According to the results, the best algorithm for the prediction of the outcome variable (`classe`) is *also* C5.0 classification algorithm. It shows almost perfect prediction for the validation set also. This makes the overfitting possibility sufficiently lower.  
+
+So, the final best model we choose for the testing set outcome prediction is C5.0. 
+
+For reference, the C5.0 method is based on C4.5, which in turn according to [Wu et al.(2007)](http://www.cs.uvm.edu/~icdm/algorithms/10Algorithms-08.pdf) is one of the most popular (top 10) machine learning algorithms in data mining.  
+You could read good detail description of this algorithm [here](http://rayli.net/blog/data/top-10-data-mining-algorithms-in-plain-english/#1_C45).
+
+# Final model presentation
+
+Here is the final regression tree model, constructed by C5.0 classificator on the training set with 5-fold cross-validation control.
+
+Code for this part could be found in [Appendix.Presenting final model](#id5).
+
+**Table 3. Confusion Matrix for the training set.**
+```{r table3, echo = FALSE, cache = TRUE}
+cm5.0tr$table
+```
+
+**Table 4. Confusion Matrix for the validation set.**
+```{r table4, echo = FALSE, cache = TRUE}
+cm5.0$table
+```
+
+**Table 5. Variable Importance.**
+
+```{r table5, echo = FALSE, cache = TRUE}
+a <- varImp(C5.0.m)
+
+groups <- 1
+groups <- ifelse(a$importance[, 1] > 80, 
+                 1, ifelse(a$importance[, 1] > 40, 2, 3))
+colours <- 1
+colours <- ifelse(a$importance[, 1] > 80, 
+                  "chartreuse3", ifelse(a$importance[, 1] > 40,
+                                        "cadetblue3", "firebrick3"))
+
+dotchart(a$importance[, 1], labels = row.names(a$importance),
+         groups = groups,
+         gcolor = "black",
+         color = colours,
+         cex = 0.65, pch = 19)
+```
+
+**Tuning details**
+```{r tune_details, echo = FALSE, cache = TRUE}
+C5.0.m$finalModel$tuneValue
+
+plot(C5.0.m)
+```
+
+# Submission to Coursera
+
+Now we could predict `classe` values and submit the result to Coursera.
+
+```{r submission, echo = TRUE, cache = TRUE}
+# Prediction
+answers <- predict(C5.0.m, testRaw)
+answers <- as.character(answers)
+
+# Preparation for submission
+pml_write_files = function(x){
+  n = length(x)
+  path <- "C:/PracticalML/Answers"
+  for(i in 1:n){
+    filename = paste0("problem_id_",i,".txt")
+    write.table(x[i],file=file.path(path, filename),quote=FALSE,row.names=FALSE,col.names=FALSE)
+  }
+}
+pml_write_files(answers)
+```
+
+
+# Appendix
+
+<a id="id1"></a>
+
+## Appendix.Loading data 
+
+```{r loading_code, echo = TRUE, message = FALSE, warning = FALSE, cache = TRUE, eval = FALSE}
+library(ggplot2)
+library(caret)
+library(randomForest)
+library(e1071)
+library(corrplot)
+
+
+options(digits = 2)
+setwd("C:/PracticalML")
+
+download.file("http://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv", destfile = "Train.csv")
+download.file("http://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv", destfile = "Test.csv")
+
+trainRaw = read.csv("Train.csv", na.strings=c("", "NA", "NULL"))
+testRaw = read.csv("Test.csv", na.strings=c("", "NA", "NULL"))
+
+trainRaw$classe <- as.factor(trainRaw$classe)
+
+summary(trainRaw$classe)
+```
+
+<a id="id2"></a>
+
+## Appendix. Covariates preprocessing
+
+```{r preprocess_code, echo = TRUE, message = FALSE, warning = FALSE, cache = TRUE, eval = FALSE}
+# Removing columns with NAs
+trainTrf <- trainRaw[ , colSums(is.na(trainRaw)) == 0]
+delta1 <- dim(trainRaw)[2] - dim(trainTrf)[2]
+
+# Removing unrelevant variables
+relevantVar <- grepl("belt|[^(fore)]arm|dumbbell|forearm|classe", names(trainTrf))
+trainRel <- trainTrf[, relevantVar]
+delta2 <- dim(trainTrf)[2] - dim(trainRel)[2]
+
+# Removing nzv variables
+nzv= nearZeroVar(trainRel[sapply(trainRel, is.numeric)], saveMetrics = TRUE)
+trainNnzv = trainRel[, nzv[, 'nzv'] == FALSE]
+delta3 <- dim(trainRel)[2] - dim(trainNnzv)[2]
+
+# Remove highly correlated variables
+corrM <- cor(trainNnzv[sapply(trainNnzv, is.numeric)])
+highCorr <- findCorrelation(corrM, cutoff = .85, verbose = FALSE)
+trainItog <- trainNnzv[, -highCorr]
+delta4 <- dim(trainNnzv)[2] - dim(trainItog)[2]
+```
+
+<a id="id3"></a>
+
+## Appendix.Corrplot 
+
+```{r corrplot_code, echo = TRUE, message = FALSE, warning = FALSE, cache = TRUE, eval = FALSE}
+par(oma = c(0,0,2,0))
+colour <- colorRampPalette(c("mediumpurple4", "white", "olivedrab"))
+corrplot(corrM, col = colour(10), order = "alphabet", 
+         method = "color", type = "lower", 
+         tl.cex = 0.7, tl.col = "black", main = "Correlation matrix of covariates")
+```
+
+<a id="id4"></a>
+
+## Appendix.Evaluating models 
+
+```{r evaluating_code, echo = TRUE, message = FALSE, warning = FALSE, cache = TRUE, eval = FALSE}
+# set seed
+set.seed(2301)
+
+# Setting clusters
+cl <- makeCluster(detectCores() - 1)
+registerDoParallel(cl)
+
+# Setting control parameters 
+ctrl <- trainControl(method = "repeatedcv", 
+                     number = 5,
+                     classProbs=TRUE,
+                     savePredictions=TRUE,
+                     allowParallel=TRUE)
+
+# (1) C5.0
+C5.0.m <- train(train$classe ~ ., method = "C5.0", verbose = FALSE,
+               data = train, trControl = ctrl) # evaluating C5.0 
+cm5.0 <- confusionMatrix(valid$classe, 
+                      predict(C5.0.m, valid)) # conf matrix for valid set
+quality <- c(cm5.0$overall[1], cm5.0$byClass[1:4]) 
+
+cm5.0tr <- confusionMatrix(train$classe, 
+                      predict(C5.0.m, train)) # conf matrix for train set
+quality.train <- c(cm5.0tr$overall[1], cm5.0tr$byClass[1:4])
+
+# (2) gbm
+gbm.m <- train(train$classe ~ ., method = "gbm", verbose = FALSE,
+               data = train, trControl = ctrl)
+cm.gbm <- confusionMatrix(valid$classe, 
+                      predict(gbm.m, valid))
+quality.new <- c(cm.gbm$overall[1], cm.gbm$byClass[1:4])
+quality <- rbind(quality, quality.new)
+
+cm.gbmtr <- confusionMatrix(train$classe, 
+                      predict(gbm.m, train))
+quality.train.new <- c(cm.gbmtr$overall[1], cm.gbmtr$byClass[1:4])
+quality.train <- rbind(quality.train, quality.train.new)
+
+# (3) rf
+rf.m <- train(train$classe ~ ., method = "rf", verbose = FALSE,
+               data = train, trControl = ctrl)
+cm.rf <- confusionMatrix(valid$classe, 
+                      predict(rf.m, valid))
+quality.new <- c(cm.rf$overall[1], cm.rf$byClass[1:4])
+quality <- rbind(quality, quality.new)
+
+cm.rftr <- confusionMatrix(train$classe, 
+                      predict(rf.m, train))
+quality.train.new <- c(cm.rftr$overall[1], cm.rftr$byClass[1:4])
+quality.train <- rbind(quality.train, quality.train.new)
+# (4) treebag
+treebag.m <- train(train$classe ~ ., method = "treebag", 
+                   verbose = FALSE, data = train, trControl = ctrl)
+cm.treebag <- confusionMatrix(valid$classe, 
+                      predict(treebag.m, valid))
+quality.new <- c(cm.treebag$overall[1], cm.treebag$byClass[1:4])
+quality <- rbind(quality, quality.new)
+
+cm.treebagtr <- confusionMatrix(train$classe, 
+                      predict(treebag.m, train))
+quality.train.new <- c(cm.treebagtr$overall[1], cm.treebagtr$byClass[1:4])
+quality.train <- rbind(quality.train, quality.train.new)
+
+# (5) nnet
+nnet.m <- train(train$classe ~ ., method = "nnet", 
+                   verbose = FALSE, data = train, trControl = ctrl)
+cm.nnet <- confusionMatrix(valid$classe, 
+                      predict(nnet.m, valid))
+quality.new <- c(cm.nnet$overall[1], cm.nnet$byClass[1:4])
+quality <- rbind(quality, quality.new)
+
+cm.nnettr <- confusionMatrix(train$classe, 
+                      predict(nnet.m, train))
+quality.train.new <- c(cm.nnettr$overall[1], cm.nnettr$byClass[1:4])
+quality.train <- rbind(quality.train, quality.train.new)
+
+# (6) svmRadial
+svmRadial.m <- train(train$classe ~ ., method = "svmRadial", 
+                   verbose = FALSE, data = train, trControl = ctrl)
+cm.svmRadial <- confusionMatrix(valid$classe, 
+                      predict(svmRadial.m, valid))
+quality.new <- c(cm.svmRadial$overall[1], cm.svmRadial$byClass[1:4])
+quality <- rbind(quality, quality.new)
+
+cm.svmRadialtr <- confusionMatrix(train$classe, 
+                      predict(svmRadial.m, train))
+quality.train.new <- c(cm.svmRadialtr$overall[1], cm.svmRadialtr$byClass[1:4])
+quality.train <- rbind(quality.train, quality.train.new)
+
+# Stop clusters
+stopCluster(cl)
+
+# Naming datasets
+methods.m <- c("C5.0", "gbm", "rf", "treebag", 
+               "nnet", "svmRadial")
+quality <- as.data.frame(quality)
+quality.train <- as.data.frame(quality.train)
+
+row.names(quality) <- methods.m
+row.names(quality.train) <- methods.m
+```
+
+
+**Table 1. Model evaluation results: training set with cross-validation.**
+```{r, echo = TRUE, cache = TRUE, eval = FALSE}
+library(printr)
+options(digits = 2)
+names.col <- c("Accuracy", "Sensitivity", "Specificity",
+               "Pos.Pred.Value", "Neg.Pred.Value")
+names(quality.train) <- names.col
+quality.train
+```
+
+**Table 1. Model evaluation results: validation set.**
+```{r, echo = TRUE, cache = TRUE, eval = FALSE}
+options(digits = 2)
+names(quality) <- names.col
+quality
+```
+
+<a id="id5"></a>
+
+# Appendix. Presenting final model
+
+**Table 3. Confusion Matrix for the training set.**
+```{r table3_code, echo = TRUE, cache = TRUE, eval = FALSE}
+cm5.0tr$table
+```
+
+**Table 4. Confusion Matrix for the validation set.**
+```{r table4_code, echo = TRUE, cache = TRUE, eval = FALSE}
+cm5.0$table
+```
+
+**Table 5. Variable Importance.**
+
+```{r table5_code, echo = TRUE, cache = TRUE, eval = FALSE}
+a <- varImp(C5.0.m)
+
+groups <- 1
+groups <- ifelse(a$importance[, 1] > 80, 
+                 1, ifelse(a$importance[, 1] > 40, 2, 3))
+colours <- 1
+colours <- ifelse(a$importance[, 1] > 80, 
+                  "chartreuse3", ifelse(a$importance[, 1] > 40,
+                                        "cadetblue3", "firebrick3"))
+
+dotchart(a$importance[, 1], labels = row.names(a$importance),
+         groups = groups,
+         gcolor = "black",
+         color = colours,
+         cex = 0.65, pch = 19)
+```
+
+**Tuning details**
+```{r tune_details_code, echo = TRUE, cache = TRUE, eval = FALSE}
+C5.0.m$finalModel$tuneValue
+
+plot(C5.0.m)
+```
